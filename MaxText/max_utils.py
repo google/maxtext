@@ -112,9 +112,10 @@ def fill_unspecified_mesh_axes(parallelism_vals, target_product, parallelism_typ
 
   return parallelism_vals
 
-def create_device_mesh(config, logging=True):
+def create_device_mesh(config, logging=True, devices=jax.devices(), dcn_parallelism = None):
   """Creates a device mesh with each slice in its own data parallel group. If there is only one slice, uses two replicas """
-  devices = jax.devices()
+  
+  #devices = jax.devices()
   num_devices = len(devices)
   try:
     num_slices = 1 + max([d.slice_index for d in devices])
@@ -126,7 +127,8 @@ def create_device_mesh(config, logging=True):
 
   multi_slice_env = hasattr(jax.devices()[0], 'slice_index')
 
-  dcn_parallelism = [config.dcn_data_parallelism, config.dcn_fsdp_parallelism, config.dcn_tensor_parallelism]
+  if dcn_parallelism is None:
+    dcn_parallelism = [config.dcn_data_parallelism, config.dcn_fsdp_parallelism, config.dcn_tensor_parallelism]
   ici_parallelism = [config.ici_data_parallelism, config.ici_fsdp_parallelism, config.ici_tensor_parallelism]
 
   # Find possible unspecified parallelisms
@@ -134,7 +136,7 @@ def create_device_mesh(config, logging=True):
   ici_parallelism = fill_unspecified_mesh_axes(ici_parallelism, num_devices_per_slice, 'ICI')
 
   if multi_slice_env:
-    mesh = mesh_utils.create_hybrid_device_mesh(ici_parallelism, dcn_parallelism)
+    mesh = mesh_utils.create_hybrid_device_mesh(ici_parallelism, dcn_parallelism, devices=devices)
   else:
     mesh = mesh_utils.create_device_mesh(ici_parallelism)
 
@@ -202,6 +204,7 @@ def setup_initial_state(model, tx, config, rng, mesh, checkpoint_manager):
   state_logical_annotations = nn.get_partition_spec(abstract_state)
   unboxed_abstract_state = unbox_logicallypartioned_trainstate(abstract_state)
 
+  # passed in mesh with only slice 0 devices
   # Initialization
   with nn_partitioning.axis_rules(config.logical_axis_rules):
     state_mesh_annotations = nn.logical_to_mesh(state_logical_annotations)
@@ -212,6 +215,7 @@ def setup_initial_state(model, tx, config, rng, mesh, checkpoint_manager):
                                                 unboxed_abstract_state,
                                                 mesh,
                                                 state_mesh_annotations)
+    max_logging.log("State restored!")
 
     state_mesh_shardings = jax.tree_map(
         lambda p: jax.sharding.NamedSharding(mesh, p), state_mesh_annotations)
