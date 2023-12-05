@@ -21,8 +21,9 @@ import jax
 import portpicker
 from jax.experimental import multihost_utils
 from orbax import checkpoint
-from orbax.checkpoint.checkpoint_manager import CheckpointManager, CheckpointManagerOptions, Checkpointer, AsyncCheckpointer
+from orbax.checkpoint.checkpoint_manager import CheckpointManagerOptions, Checkpointer, AsyncCheckpointer
 from orbax.checkpoint import type_handlers
+from local_checkpoint_manager import CheckpointManager
 import socket
 
 import max_logging
