@@ -247,3 +247,4 @@ decode_sampling_temperature: 1.
 
 eval_interval: -1  # the specific number of train step between eval_step
 target_eval_loss: 0.  # early stop once reaching target eval_loss
+use_megatron_tflops: False # use tflops calculation used in https://arxiv.org/abs/2205.05198 (more accurate for transformer models)
