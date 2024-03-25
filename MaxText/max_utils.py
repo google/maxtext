@@ -349,7 +349,10 @@ def init_initial_state(model, tx, config, is_training, key):
                           jnp.ones(input_shape, dtype=jnp.int32),
                           jnp.ones(input_shape, dtype=jnp.int32))
   if is_training:
-    return init_training_state(model.apply, model_vars['params'], tx)
+    if config.quantization=="fp8":
+      return init_training_state(model.apply, model_vars, tx)
+    else:
+      return init_training_state(model.apply, model_vars['params'], tx)
   return init_decode_state(model.apply, model_vars['params'])
 
 def load_decode_model_vars(model, config, rng, mesh):

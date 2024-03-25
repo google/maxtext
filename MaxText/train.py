@@ -209,7 +209,15 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
     for k, v in data.items():
       data[k] = v[:config.global_batch_size_to_train_on,:]
 
-  logits, intermediate_outputs = model.apply({'params': params},
+  if config.quantization=="fp8":
+    logits, intermediate_outputs = model.apply(params,
+                       data['inputs'],
+                       data['inputs_position'],
+                       decoder_segment_ids=data['inputs_segmentation'],
+                       enable_dropout=config.enable_dropout if is_train else False,
+                       rngs={'dropout': rng1, 'params': aqt_rng}, mutable='intermediates')
+  else:
+    logits, intermediate_outputs = model.apply({'params': params},
                        data['inputs'],
                        data['inputs_position'],
                        decoder_segment_ids=data['inputs_segmentation'],
