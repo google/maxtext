@@ -18,6 +18,8 @@
 """Utils that are only interesting to MaxText. """
 
 import jax
+import max_utils
+import numpy as np
 from jax.sharding import PartitionSpec as P
 from jax.experimental.serialize_executable import deserialize_and_load
 
@@ -124,3 +126,53 @@ def calculate_tflops_prefill(num_model_parameters, prefill_length, config, log=T
           f'\t\tCausal attention TFLOPs: {causal_attention_tflops} ',
           f'({100 * causal_attention_tflops/total_tflops:.2f})% of Total')
   return total_tflops, learnable_weight_tflops, causal_attention_tflops
+
+
+def calc_not_sharded_params(shard,
+                      expected_per_device_num_param,
+                      key,
+                      pspec,
+                      num_devices_sharded
+                      ):
+  """Returns the number of params that aren't sharded."""
+  new_num_p = np.prod(shard.data.shape)
+
+  if new_num_p == expected_per_device_num_param:
+    print(f'Input is sharded over {num_devices_sharded} devices as expected!')
+  else:
+    print(f'Expected {expected_per_device_num_param} params but got {new_num_p}')
+    print(f'Off by a factor of {new_num_p // expected_per_device_num_param}')
+    print('key path', key)
+    print('pspec', pspec)
+    if jax.process_index() == 0:
+      return new_num_p
+  return 0
+
+def is_sharded_correctly(params):
+  """Checks whether most params are sharded accros sharding axis.
+
+  Given state params, function checks if over 99% of params are
+  sharded accross 'fsdp', 'fsdp_transpose','sequence', 'tensor' axes.
+  """
+  num_not_sharded_params = [0]
+  total_num_params = max_utils.calculate_num_params_from_pytree(params)
+
+  def check_state_shardings(key, pytree):
+    """Checks whether given pytree is sharded accross the sharding axes and
+    updates the number of not sharded params."""
+    pspec = pytree.sharding.spec
+    num_devices_sharded = 1
+    for axis in ['fsdp', 'fsdp_transpose','sequence', 'tensor']:
+      num_devices_sharded *= pytree.sharding.mesh.shape[axis]
+
+    num_params = max_utils.calculate_num_params_from_pytree(pytree)
+    expected_num_p = num_params // num_devices_sharded
+    for shard in pytree.addressable_shards:
+      num_not_sharded_params[0] += calc_not_sharded_params(
+        shard, expected_num_p, key, pspec, num_devices_sharded) // jax.local_device_count()
+
+  jax.tree_util.tree_map_with_path(
+    check_state_shardings,
+    params,
+    )
+  return num_not_sharded_params[0] * 100 / (total_num_params * 1e9) < 1
