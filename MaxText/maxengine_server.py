@@ -41,7 +41,7 @@ def main(config):
   # local credentials.
   # TODO: Add grpc credentials for OSS.
   jetstream_server = server_lib.run(
-      threads=256,
+      threads=1,
       port=9000,
       config=server_config,
       devices=devices,
