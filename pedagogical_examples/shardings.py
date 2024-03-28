@@ -34,7 +34,7 @@ from typing import Sequence
 parser = argparse.ArgumentParser(
   description="Experiment different sharding techniques with a simple NN.\
   Ensure 1) The product of dcn dimensions == number of slices \
-  2) product of ici dimension = number of devices per slice"
+  2) product of ici dimension == number of devices per slice"
   )
 parser.add_argument(
     "--profiler_path", "-p",
