@@ -159,14 +159,17 @@ num_slices: -1
 # Replace with your path given as argument in download_dataset.sh, e.g. "gs://my-maxtext-dataset/"
 dataset_path: ""
 vocab_size: 32_000 # powers of 2 for sharding
+#tokenizer_path: "assets/tokenizer.llama2"
 tokenizer_path: "assets/tokenizer.llama2"
-dataset_name: 'c4/en:3.0.1'
-eval_dataset_name: 'c4/en:3.0.1'
+#dataset_name: 'c4/en:3.0.1'
+dataset_name: 'allenai/c4'
+dataset_dir: 'en'
+eval_dataset_name: ''
 eval_split: 'validation'
 per_device_batch_size: 12.0
 eval_per_device_batch_size: 0
 max_corpus_chars: 10_000_000
-dataset_type: c4 # must be c4 or synthetic
+dataset_type: hf # must be c4 or synthetic
 
 # Setting for grain
 grain_worker_count: 4
