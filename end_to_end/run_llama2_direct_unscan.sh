@@ -3,7 +3,7 @@
 set -ex
 idx=$(date +%Y-%m-%d-%H-%M)
 
-convert_idx="2024-03-27-03-37"
+export convert_idx="2024-03-27-03-37"
 
 export BASE_OUTPUT_DIRECTORY=gs://runner-maxtext-logs
 export ASYNC_CHECKPOINTING=false
