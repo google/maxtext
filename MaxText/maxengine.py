@@ -34,6 +34,9 @@ from jetstream.engine import tokenizer_pb2
 import max_utils
 import inference_utils
 
+import orbax
+from flax.training import orbax_utils
+
 
 Prefix = Any
 Params = Any
@@ -64,62 +67,75 @@ class MaxEngine(engine_api.Engine):
     devices_array = max_utils.create_device_mesh(config)
     self._mesh = jax.sharding.Mesh(devices_array, config.mesh_axes)
 
-    # Model and Optimizer definition
-    quant = quantizations.configure_quantization(config)
+    # Model definition
+    quant = quantizations.configure_quantization(config, 'serve')
     self.model = models.Transformer(config, mesh=self._mesh, quant=quant)
     self.replicated_sharding = jax.sharding.NamedSharding(self._mesh, P(None))
-
     self.abstract_params = None
-    self.kv_cache_annotations = None
-    self.kv_cache_annotations_named = None
-    self.kv_cache_shardings = None
     self.state_mesh_annotations = None
+    self.kv_cache_annotations = None
+    self.kv_cache_shardings = None
+    self.kv_cache_annotations_named = None
 
-  def load_params(self, *args, **kwargs) -> Params:
-    """Load Parameters, typically from GCS"""
-    # pylint: disable=unused-argument
+
+  def save_checkpoint(self, params):
+    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+    save_args = orbax_utils.save_args_from_target({"params":params})
+    orbax_checkpointer.save(
+      self.config.save_quantized_params_path, {"params":params}, save_args=save_args, force=True
+      )
+    print("QUANTIZED CHECKPOINT SAVED AT: ", self.config.save_quantized_params_path)
+
+  def load_checkpoint_and_quantize_on_fly(self):
+    self.model.quant.quant_mode = quantizations.get_quant_mode("convert")
+    state, self.state_mesh_annotations = max_utils.setup_decode_state(self.model, self.config, self.rng, self._mesh, None)
+    @jax.jit
+    def model_apply(_p, _rng):
+      return self.model.apply(
+        _p | {"aqt": {}},
+        jnp.ones((1, self.config.max_prefill_predict_length), dtype=jnp.int32),
+        jnp.ones((1, self.config.max_prefill_predict_length), dtype=jnp.int32),
+        decoder_segment_ids=jnp.zeros((1, self.config.max_prefill_predict_length), dtype=jnp.int32),
+        enable_dropout=False,
+        model_mode=common_types.MODEL_MODE_PREFILL,
+        rngs={"params": _rng},
+        mutable=True,
+        )
+    _, new_vars = model_apply(state.params, self.rng)
+    quant_params = {}
+    quant_params["aqt"] = new_vars["aqt"]
+    # Remove param values which have corresponding qtensors in aqt to save memory.
+    quant_params["params"] = quantizations.remove_quantized_params(state.params["params"], new_vars["aqt"])
+    self.abstract_params = jax.tree_util.tree_map(
+      lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding), quant_params
+      )
+    if self.config.save_quantized_params_path:
+      self.save_checkpoint(quant_params)
+    self.model.quant.quant_mode = quantizations.get_quant_mode("serve")
+    return quant_params
+
+  def load_checkpoint(self):
     state, self.state_mesh_annotations = max_utils.setup_decode_state(self.model, self.config, self.rng, self._mesh, None)
     self.abstract_params = jax.tree_util.tree_map(
         lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding), state.params
     )
-    self.kv_cache_annotations = max_utils.get_kv_cache_annotations(self.model, self.config, self.rng, self._mesh)
-    self.kv_cache_shardings = jax.tree_util.tree_map(
-      lambda x: jax.sharding.NamedSharding(self._mesh, x), self.kv_cache_annotations)
+    return state.params
 
-    if not self.model.quant:
-      self.abstract_params = jax.tree_util.tree_map(
-          lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding), state.params
-      )
-      return state.params
+
+  def load_params(self, *args, **kwargs) -> Params:
+    """Load Parameters, typically from GCS"""
+    # pylint: disable=unused-argument
+    quantize_on_fly =  self.model.quant and not self.config.load_quantized_params
+    if quantize_on_fly:
+      params = self.load_checkpoint_and_quantize_on_fly()
     else:
-      self.model.quant.quant_mode = quantizations.get_quant_mode("convert")
+      params = self.load_checkpoint()
+    max_utils.print_mem_stats('After loading checkpoint')
 
-      @jax.jit
-      def model_apply(_p, _rng):
-        return self.model.apply(
-            _p | {"aqt": {}},
-            jnp.ones((1, self.config.max_prefill_predict_length), dtype=jnp.int32),
-            jnp.ones((1, self.config.max_prefill_predict_length), dtype=jnp.int32),
-            decoder_segment_ids=jnp.zeros((1, self.config.max_prefill_predict_length), dtype=jnp.int32),
-            enable_dropout=False,
-            model_mode=common_types.MODEL_MODE_PREFILL,
-            rngs={"params": _rng},
-            mutable=True,
-        )
-
-      _, new_vars = model_apply(state.params, self.rng)
-
-      params = {}
-      params["aqt"] = new_vars["aqt"]
-      # Remove param values which have corresponding qtensors in aqt to save memory.
-      params["params"] = quantizations.remove_quantized_params(state.params["params"], new_vars["aqt"])
-
-      self.abstract_params = jax.tree_util.tree_map(
-          lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding), params
-      )
-
-      self.model.quant.quant_mode = quantizations.get_quant_mode("serve")
-      return params
+    self.kv_cache_annotations = max_utils.get_kv_cache_annotations(self.model, self.config, self.rng, self._mesh)
+    self.kv_cache_shardings = jax.tree_util.tree_map(lambda x: jax.sharding.NamedSharding(self._mesh, x), self.kv_cache_annotations)
+    max_utils.print_mem_stats('After load_params')
+    return params
 
   @functools.partial(jax.jit, static_argnums=(0,))
   def prefill(

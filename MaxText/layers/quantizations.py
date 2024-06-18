@@ -24,6 +24,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from jax.tree_util import tree_flatten_with_path, tree_unflatten
+from typing import Tuple, Sequence
 
 MAX_INT8 = 127.5
 
@@ -37,6 +38,20 @@ class Quantization:
     pass
 
 
+def _rhs_axis_metadata_wrapper(x: jnp.ndarray, no_sharding_axis: Sequence[int], mesh_axes: Tuple[str, ...], is_tiled: bool):
+  mesh_axes = list(mesh_axes)
+  if is_tiled:
+    # The original rank of x will be doubled, e.x. [a, b, c] --> [_, a', _, b', _, c'].
+    # The mesh axes should be doubled too.
+    assert len(x.shape) >= 2 * len(mesh_axes)
+    mesh_axes = [None] * (len(x.shape) - 2 * len(mesh_axes)) + sum(
+        ([None, axis] for axis in mesh_axes), []
+    )
+  if mesh_axes is not None and len(mesh_axes) > 0:
+    for no_shard_idx in no_sharding_axis:
+      mesh_axes[no_shard_idx] = None
+  return nn.with_logical_partitioning((lambda: x), mesh_axes)()
+
 @dataclass
 class AqtQuantization:
   """Configures AQT quantization github.com/google/aqt."""
@@ -44,25 +59,41 @@ class AqtQuantization:
   quant_dg: aqt_config.DotGeneral
   quant_mode: aqt_flax.QuantMode = aqt_flax.QuantMode.TRAIN
 
-  def dot_general_cls(self):
+
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
     """Returns dot_general configured with aqt params."""
+    rhs_axis_metadata_wrapper = None
+    if self.quant_mode != aqt_flax.QuantMode.CONVERT:
+     rhs_axis_metadata_wrapper = functools.partial(
+        _rhs_axis_metadata_wrapper, mesh_axes=mesh_axes, is_tiled=False
+      )
     aqt_dg_cls = functools.partial(
         aqt_flax.AqtDotGeneral,
         self.quant_dg,
         rhs_quant_mode=self.quant_mode,
         lhs_freeze_mode=aqt_flax.FreezerMode.NONE,
         rhs_freeze_mode=aqt_flax.FreezerMode.CALIBRATION_AND_VALUE,
+        rhs_axis_metadata_wrapper=rhs_axis_metadata_wrapper,
+        use_legacy_freezer=False,
     )
     return aqt_dg_cls
 
-  def einsum(self):
+
+  def einsum(self, mesh_axes: Tuple[str, ...] = ()):
     """Returns einsum configured with aqt params."""
+    rhs_axis_metadata_wrapper = None
+    if self.quant_mode != aqt_flax.QuantMode.CONVERT:
+     rhs_axis_metadata_wrapper = functools.partial(
+        _rhs_axis_metadata_wrapper, mesh_axes=mesh_axes, is_tiled=False
+      )
     aqt_einsum = functools.partial(
         aqt_flax.AqtEinsum(
             cfg=self.quant_dg,
             lhs_quant_mode=self.quant_mode,
             lhs_freeze_mode=aqt_flax.FreezerMode.NONE,
             rhs_freeze_mode=aqt_flax.FreezerMode.CALIBRATION_AND_VALUE,
+            rhs_axis_metadata_wrapper=rhs_axis_metadata_wrapper,
+            use_legacy_freezer=False,
         )
     )
     return aqt_einsum

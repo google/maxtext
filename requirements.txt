@@ -10,6 +10,7 @@ datasets
 gcsfs
 google-cloud-storage
 grain-nightly
+humanize
 flax>=0.8.0
 ml-collections
 ml-goodput-measurement

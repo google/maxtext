@@ -114,7 +114,7 @@ class DenseGeneral(nn.Module):
       """Computes a dot_general operation that may be quantized."""
       dot_general = lax.dot_general
       if self.quant:
-        dot_general_cls = self.quant.dot_general_cls()
+        dot_general_cls = self.quant.dot_general_cls(mesh_axes=self.kernel_axes)
         dot_general = dot_general_cls()
       return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None)
 
@@ -289,14 +289,14 @@ class MoeBlock(nn.Module):
   dtype: DType = jnp.float32
 
   def generate_kernels(self, num_experts, emb_dim, mlp_dim):
-    
+
     kernel_in_axis = np.arange(1)
     kernel_out_axis = np.arange(1, 2)
     kernel_init = nd_dense_init(1.0, 'fan_in', 'truncated_normal')
 
     kernel_axes = ('exp', 'embed', 'mlp')
     wo_kernel_axes = ('exp', 'mlp', 'embed')
-    
+
     w0_kernel = self.param(
         'wi_0',
         nn.with_logical_partitioning(kernel_init, kernel_axes),
@@ -368,7 +368,7 @@ class MoeBlock(nn.Module):
     )
     def gmm(inputs, kernel, group_sizes):
       hs_shape = inputs.shape
-      # pad lengh is the 1st dimension of tiling size in gmm call
+      # pad length is the 1st dimension of tiling size in gmm call
       pad_length = 512
       if hs_shape[0] % pad_length:
         pad_length = pad_length - hs_shape[0] % pad_length
@@ -403,7 +403,7 @@ class MoeBlock(nn.Module):
             kernel_init=self.kernel_init,
             kernel_axes=self.kernel_axes,
             name="gate")(inputs)
-    
+
     top_k_weights, top_k_indices = jax.lax.top_k(gate_logits, self.num_experts_per_tok)
     flattened_top_k_weights = top_k_weights.reshape(-1, self.num_experts_per_tok)
 

@@ -18,6 +18,7 @@ limitations under the License.
 import checkpointing
 import common_types
 import functools
+import humanize
 import time
 import socket
 import subprocess
@@ -805,3 +806,13 @@ def summarize_pytree_data(params, name="Params", raw=False):
         f"\tAvg size: {avg_param_size:.3f} bytes\n"
     )
   return num_params, total_param_size, avg_param_size
+
+
+def print_mem_stats(label:str):
+  print(f'\nMemstats: {label}:')
+  fmt_size = functools.partial(humanize.naturalsize, binary=True)
+  for d in jax.local_devices():
+    stats = d.memory_stats()
+    used = stats['bytes_in_use']
+    limit = stats['bytes_limit']
+    print(f"\tUsing {fmt_size(used)} / {fmt_size(limit)} ({used/limit:%}) on {d}")
