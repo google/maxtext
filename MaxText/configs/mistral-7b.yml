@@ -1,0 +1,19 @@
+base_config: "base.yml"
+
+# Args coming from the NVIDIA spreadsheet http://shortn/_W9CzVbtQde and
+# third_party/py/maxtext/configs/a3/llama_2_7b.
+hardware: "tpu"
+steps: 10
+model_name: "mistral-7b"
+enable_checkpointing: True
+async_checkpointing: False
+logits_dot_in_fp32: False
+weight_dtype: bfloat16
+
+max_target_length: 128
+tokenizer_path: assets/tokenizer.mistral
+
+dataset_type: "tfds"
+dataset_path: "gs://rdyro-local"
+dataset_name: "c4/en:3.0.1"
+eval_dataset_name: "c4/en:3.0.1"

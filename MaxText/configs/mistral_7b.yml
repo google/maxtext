@@ -1,0 +1,12 @@
+base_config: "base.yml"
+
+# Args coming from the NVIDIA spreadsheet http://shortn/_W9CzVbtQde and
+# third_party/py/maxtext/configs/a3/llama_2_7b.
+hardware: "tpu"
+model_name: "mistral-7b"
+enable_checkpointing: True
+async_checkpointing: False
+logits_dot_in_fp32: False
+
+max_target_length: 128
+tokenizer_path: assets/tokenizer.mistral

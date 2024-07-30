@@ -22,6 +22,8 @@ To save a ckpt
 python3 MaxText/llama_or_mistral_ckpt.py --base-model-path <path/to/meta/ckpt> \
     --maxtext-model-path <GCS/path/to/save/new/maxtext/ckpt> --model-size llama2-7b
 
+The base model checkpoints should be in the format `{name}.{chkpt_idx}.pth` 
+For example: `mistral-7b.00.pth`
 For large size model (e.g. 70B model), this script requires large memory VM.
 The script load and save weights in a single pass.
 To fit less memory, modify convert() to load/save weights in multiple passes.
@@ -30,25 +32,30 @@ Each pass, load and save partial weights (subset of all weight variables).
 # pylint: disable=g-line-too-long
 import argparse
 import pathlib
+import os
+import sys
+import gc
+import re
+import logging
+from dataclasses import dataclass
 
+os.environ["JAX_PLATFORMS"] = "cpu"
+
+# pyling: disable
 import numpy as np
-
-import checkpointing
 import jax
+from jax import tree
 from flax.training import train_state
+import torch
+import psutil
+from tqdm import tqdm
+
 import max_logging
 from train import save_checkpoint
-import torch
-import sys
-import os
+import checkpointing
 
-jax.config.update("jax_platform_name", "cpu")
+logging.basicConfig()
 
-
-def permute_to_match_maxtext_rope(arr):
-  evens = arr[..., ::2]
-  odds = arr[..., 1::2]
-  return jax.numpy.concatenate((evens, odds), axis=arr.ndim - 1)
 
 
 MODEL_PARAMS_DICT = {
@@ -106,20 +113,78 @@ MODEL_PARAMS_DICT = {
         "base_mlp_dim": 14336,
         "num_experts": 8,
     },
+    "mixtral-8x22b": {
+        "num_layers": 56,
+        "num_heads": 48,
+        "num_kv_heads": 8,
+        "dims_per_head": 128,
+        "vocab": 32000,
+        "base_emb_dim": 6144,
+        "base_mlp_dim": 16384,
+        "num_experts": 8,
+    },
 }
 
 SIMULATED_CPU_DEVICES_COUNT = 16
 
+def _hf_mapping(layer_idx: int = -1, expert_idx: int = -1) -> dict:
+  return {
+    "tok_embeddings.weight": "model.embed_tokens.weight",
+    "norm.weight": "model.norm.weight",
+    "output.weight": "lm_head.weight",
+    # MOE model
+    f"layers.{layer_idx}.attention_norm.weight": f"model.layers.{layer_idx}.input_layernorm.weight",
+    f"layers.{layer_idx}.ffn_norm.weight": f"model.layers.{layer_idx}.post_attention_layernorm.weight",
+    f"layers.{layer_idx}.attention.wq.weight": f"model.layers.{layer_idx}.self_attn.q_proj.weight",
+    f"layers.{layer_idx}.attention.wk.weight": f"model.layers.{layer_idx}.self_attn.k_proj.weight",
+    f"layers.{layer_idx}.attention.wv.weight": f"model.layers.{layer_idx}.self_attn.v_proj.weight",
+    f"layers.{layer_idx}.attention.wo.weight": f"model.layers.{layer_idx}.self_attn.o_proj.weight",
+    f"layers.{layer_idx}.feed_forward.gate.weight": f"model.layers.{layer_idx}.block_sparse_moe.gate.weight",
+    f"layers.{layer_idx}.feed_forward.experts.{expert_idx}.w1.weight": 
+        f"model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w1.weight",
+    f"layers.{layer_idx}.feed_forward.experts.{expert_idx}.w2.weight": 
+        f"model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w2.weight",
+    f"layers.{layer_idx}.feed_forward.experts.{expert_idx}.w3.weight": 
+      f"model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w3.weight",
+    # dense model
+    f"layers.{layer_idx}.feed_forward.w1.weight": f"model.layers.{layer_idx}.mlp.gate_proj.weight",
+    f"layers.{layer_idx}.feed_forward.w2.weight": f"model.layers.{layer_idx}.mlp.down_proj.weight",
+    f"layers.{layer_idx}.feed_forward.w3.weight": f"model.layers.{layer_idx}.mlp.up_proj.weight",
+  }
 
-def convert(base_model_path, maxtext_model_path, model_size):
+@dataclass
+class _HFNamespaceMapper:
+  """A class to dynamically map Mistral/Llama weight names to Huggingface weights 
+  if the checkpoint is from HF.
+  """
+  collection: dict
+  delimiter: str = "."
+
+  def __getitem__(self, key):
+    fields = key.split(self.delimiter)
+    num_fields = [int(field) for field in fields if re.match(r"[0-9]+", field) is not None]
+    mapping = _hf_mapping(*num_fields)
+    if key in mapping:
+      key = mapping[key]
+    else:
+      logging.warning("Could not find `%s`", key)
+    return self.collection[key]
+
+
+def permute_to_match_maxtext_rope(arr):
+  evens = arr[..., ::2]
+  odds = arr[..., 1::2]
+  return np.concatenate((evens, odds), axis=arr.ndim - 1)
+
+
+def convert_to_jax_weights(base_model_path, model_size):
   """
   Function to convert the checkpoint at base_model_path into Orbax checkpoint
-  for MaxText and save at maxtext_model_path
+  for MaxText and output jax_weights ready for MaxText
 
   Attributes:
   base_model_path: checkpoint path
-  maxtext_model_path: Path to save the MaxText checkpoint to
-  model_size: llama2-7b to 70b, mistral-7b, or mixtral-8x7b
+  model_size: llama2-7b to 70b, mistral-7b, or mixtral-8x7b, mixtral-8x22b
   """
   """Convert model to maxtext."""
   model_params = MODEL_PARAMS_DICT[model_size]
@@ -129,6 +194,8 @@ def convert(base_model_path, maxtext_model_path, model_size):
   base_num_kv_heads = model_params["num_kv_heads"]
   vocab_size = model_params["vocab"]
   num_experts = model_params["num_experts"] if "num_experts" in model_params else None
+  mem_info = psutil.Process()
+  print(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
 
   print(f"Loading the base model from {base_model_path}")
   # Skip any hidden files for checkpoints
@@ -139,19 +206,13 @@ def convert(base_model_path, maxtext_model_path, model_size):
     checkpoint = torch.load(ckpt_path, map_location="cpu")
     pytorch_vars[int(ckpt_path.name.split(".", maxsplit=2)[1])] = checkpoint
   pytorch_vars = [pytorch_vars[i] for i in sorted(list(pytorch_vars.keys()))]
+  # map weight names if they use HuggingFace instead of PyTorch convention
+  pytorch_vars = [_HFNamespaceMapper(var) for var in pytorch_vars]
 
-  if num_experts:
-    layer_key = "MoeBlock_0"
-  else:
-    layer_key = "mlp"
-  if model_size[:6] == 'llama3':
-    token_embedder = np.concatenate(
-      [var["tok_embeddings.weight"].type(torch.float16).numpy() for var in pytorch_vars], axis=0
-    )
-  else:
-    token_embedder = np.concatenate(
-      [var["tok_embeddings.weight"].type(torch.float16).numpy() for var in pytorch_vars], axis=1
-    )[:vocab_size, :]
+  print(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
+
+  # initialize the data structure for storing jax_weights
+  layer_key = "MoeBlock_0" if num_experts else "mlp"
   jax_weights = {
       "decoder": {
           "layers": {
@@ -160,45 +221,50 @@ def convert(base_model_path, maxtext_model_path, model_size):
               "post_self_attention_layer_norm": {},
               "self_attention": {},
           },
-          "decoder_norm": {"scale": pytorch_vars[0]["norm.weight"].type(torch.float16).numpy()},
-          "logits_dense": {
-              "kernel": np.concatenate(
-                  [var["output.weight"].type(torch.float16).numpy() for var in pytorch_vars], axis=0
-              ).transpose()[:, :vocab_size]
-          },
+          "decoder_norm": {"scale": None},
+          "logits_dense": {"kernel": None},
       },
-      "token_embedder": {
-          "embedding": token_embedder
-      },
+      "token_embedder": {"embedding": None},
   }
 
-  layer_weight = {"pre_self_attention_layer_norm": {"scale": []}, "post_self_attention_layer_norm": {"scale": []}}
+  # decoder norm scale ###########################################
+  print("Processing decoder norm scale")
+  decoder_norm_scale = pytorch_vars[0]["norm.weight"].type(torch.float16).numpy()
+  jax_weights["decoder"]["decoder_norm"]["scale"] = decoder_norm_scale
 
-  if num_experts is None:
-    layer_weight["mlp"] = {
-        "wi_0": {"kernel": []},
-        "wi_1": {"kernel": []},
-        "wo": {"kernel": []},
-    }
+  print(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
+
+  # logits dense #################################################
+  print("Processing logits dense")
+  logits_dense = np.concatenate([var["output.weight"].type(
+    torch.float16).numpy() for var in pytorch_vars],
+    axis=0).transpose()[:, :vocab_size]
+  jax_weights["decoder"]["logits_dense"]["kernel"] = logits_dense
+
+  print(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
+
+  # token embedding ##############################################
+  print("Processing token embeddings")
+  if model_size[:6] == 'llama3':
+    token_embedder = np.concatenate(
+      [var["tok_embeddings.weight"].type(torch.float16).numpy() for var in pytorch_vars], axis=0
+    )
   else:
-    layer_weight["gate"] = {"kernel": []}
+    token_embedder = np.concatenate(
+      [var["tok_embeddings.weight"].type(torch.float16).numpy() for var in pytorch_vars], axis=1
+    )[:vocab_size, :]
+  jax_weights["token_embedder"]["embedding"] = token_embedder
+  print(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
 
-    for k in range(num_experts):
-      jax_weights["decoder"]["layers"]["MoeBlock_0"]["gate"] = {}
-      layer_weight[f"mlp_{k}"] = {
-          "wi_0": {"kernel": []},
-          "wi_1": {"kernel": []},
-          "wo": {"kernel": []},
-      }
-
+  # self attention ###############################################
+  print("Processing self attention")
   self_attention = {
-      "query": {"kernel": []},
-      "key": {"kernel": []},
-      "value": {"kernel": []},
-      "out": {"kernel": []},
+      "query": {"kernel": None},
+      "key": {"kernel": None},
+      "value": {"kernel": None},
+      "out": {"kernel": None},
   }
-
-  for layer_idx in range(base_num_decoder_layers):
+  for layer_idx in tqdm(range(base_num_decoder_layers), desc="layers"):
     wq = np.concatenate(
         [var[f"layers.{layer_idx}.attention.wq.weight"].type(torch.float16).numpy() for var in pytorch_vars], axis=0
     ).transpose()
@@ -222,15 +288,80 @@ def convert(base_model_path, maxtext_model_path, model_size):
 
     w_post = np.reshape(w_post, [base_num_query_heads * head_dim, base_num_query_heads, head_dim])
 
-    self_attention["query"]["kernel"].append(wq)
-    self_attention["key"]["kernel"].append(wk)
-    self_attention["value"]["kernel"].append(wv)
-    self_attention["out"]["kernel"].append(w_post)
+    if self_attention["query"]["kernel"] is None:
+      stack_shape = (base_num_decoder_layers,)
+      self_attention["query"]["kernel"] = np.zeros(stack_shape + wq.shape, dtype=np.float16)
+      self_attention["key"]["kernel"] = np.zeros(stack_shape + wk.shape, dtype=np.float16)
+      self_attention["value"]["kernel"] = np.zeros(stack_shape + wv.shape, dtype=np.float16)
+      self_attention["out"]["kernel"] = np.zeros(stack_shape + w_post.shape, dtype=np.float16)
+
+    self_attention["query"]["kernel"][layer_idx, ...] = wq # pylint: disable=E1137
+    self_attention["key"]["kernel"][layer_idx, ...] = wk # pylint: disable=E1137
+    self_attention["value"]["kernel"][layer_idx, ...] = wv # pylint: disable=E1137
+    self_attention["out"]["kernel"][layer_idx, ...] = w_post # pylint: disable=E1137
+
+  self_attention["query"]["kernel"] = np.transpose(self_attention["query"]["kernel"], axes=(1, 0, 2, 3))
+  self_attention["key"]["kernel"] = np.transpose(self_attention["key"]["kernel"], axes=(1, 0, 2, 3))
+  self_attention["value"]["kernel"] = np.transpose(self_attention["value"]["kernel"], axes=(1, 0, 2, 3))
+  # layers, base_num_query_heads * head_dim, base_num_query_heads, head_dim =>
+  # base_num_query_heads, layers,head_dim, base_num_query_heads * head_dim
+  self_attention["out"]["kernel"] = np.transpose(self_attention["out"]["kernel"], axes=(2, 0, 3, 1))
+
+  # scale the query weights
+  self_attention["query"]["kernel"] = self_attention["query"]["kernel"] / np.sqrt(head_dim)
+
+  jax_weights["decoder"]["layers"]["self_attention"] = self_attention
+  print(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
+
+  # layer weight pre and post self attention norm ################
+  print("Processing pre and post self attention norms")
+  layer_weight = {"pre_self_attention_layer_norm": {"scale": None},
+                  "post_self_attention_layer_norm": {"scale": None}}
+
+  # self attention layer norm and swap the layer index
+  for layer_idx in tqdm(range(base_num_decoder_layers), desc="layers"):
     pre_self_attention_layernorm = pytorch_vars[0][f"layers.{layer_idx}.attention_norm.weight"].type(torch.float16).numpy()
     post_self_attention_layernorm = pytorch_vars[0][f"layers.{layer_idx}.ffn_norm.weight"].type(torch.float16).numpy()
-    layer_weight["pre_self_attention_layer_norm"]["scale"].append(pre_self_attention_layernorm)
-    layer_weight["post_self_attention_layer_norm"]["scale"].append(post_self_attention_layernorm)
+    if layer_weight["pre_self_attention_layer_norm"]["scale"] is None:
+      stack_shape = (base_num_decoder_layers,)
+      layer_weight["pre_self_attention_layer_norm"]["scale"] = np.zeros(
+        stack_shape + pre_self_attention_layernorm.shape, dtype=np.float16)
+      layer_weight["post_self_attention_layer_norm"]["scale"] = np.zeros(
+        stack_shape + post_self_attention_layernorm.shape, dtype=np.float16)
+    layer_weight["pre_self_attention_layer_norm"]["scale"][layer_idx, ...] = pre_self_attention_layernorm # pylint: disable=E1137
+    layer_weight["post_self_attention_layer_norm"]["scale"][layer_idx, ...] = post_self_attention_layernorm # pylint: disable=E1137
 
+  layer_weight["pre_self_attention_layer_norm"]["scale"] = np.transpose(
+      layer_weight["pre_self_attention_layer_norm"]["scale"], axes=(1, 0)
+  )
+  layer_weight["post_self_attention_layer_norm"]["scale"] = np.transpose(
+      layer_weight["post_self_attention_layer_norm"]["scale"], axes=(1, 0)
+  )
+
+  jax_weights["decoder"]["layers"]["pre_self_attention_layer_norm"] = layer_weight["pre_self_attention_layer_norm"]
+  jax_weights["decoder"]["layers"]["post_self_attention_layer_norm"] = layer_weight["post_self_attention_layer_norm"]
+  print(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
+
+  # layer weights ################################################
+  print("Processing layer weights")
+  if num_experts is None:
+    layer_weight["mlp"] = {
+        "wi_0": {"kernel": None},
+        "wi_1": {"kernel": None},
+        "wo": {"kernel": None},
+    }
+  else:
+    layer_weight["gate"] = {"kernel": None}
+
+    for k in range(num_experts):
+      jax_weights["decoder"]["layers"]["MoeBlock_0"]["gate"] = {}
+    layer_weight["mlp"] = {
+        "wi_0": {"kernel": None},
+        "wi_1": {"kernel": None},
+        "wo": {"kernel": None},
+    }
+
+  for layer_idx in tqdm(range(base_num_decoder_layers), desc="layers"):
     if num_experts is None:
       wi_0 = np.concatenate(
           [var[f"layers.{layer_idx}.feed_forward.w1.weight"].type(torch.float16).numpy() for var in pytorch_vars], axis=0
@@ -241,15 +372,23 @@ def convert(base_model_path, maxtext_model_path, model_size):
       wo = np.concatenate(
           [var[f"layers.{layer_idx}.feed_forward.w2.weight"].type(torch.float16).numpy() for var in pytorch_vars], axis=1
       ).transpose()
-      layer_weight["mlp"]["wi_0"]["kernel"].append(wi_0)
-      layer_weight["mlp"]["wi_1"]["kernel"].append(wi_1)
-      layer_weight["mlp"]["wo"]["kernel"].append(wo)
+      if layer_weight["mlp"]["wi_0"]["kernel"] is None:
+        stack_shape = (base_num_decoder_layers,)
+        layer_weight["mlp"]["wi_0"]["kernel"] = np.zeros(stack_shape + wi_0.shape, dtype=np.float16)
+        layer_weight["mlp"]["wi_1"]["kernel"] = np.zeros(stack_shape + wi_1.shape, dtype=np.float16)
+        layer_weight["mlp"]["wo"]["kernel"] = np.zeros(stack_shape + wo.shape, dtype=np.float16)
+      layer_weight["mlp"]["wi_0"]["kernel"][layer_idx, ...] = wi_0
+      layer_weight["mlp"]["wi_1"]["kernel"][layer_idx, ...] = wi_1
+      layer_weight["mlp"]["wo"]["kernel"][layer_idx, ...] = wo
     else:
       gate = np.concatenate(
           [var[f"layers.{layer_idx}.feed_forward.gate.weight"].type(torch.float16).numpy() for var in pytorch_vars], axis=0
       ).transpose()
-      layer_weight["gate"]["kernel"].append(gate)
-      for k in range(num_experts):
+      if layer_weight["gate"]["kernel"] is None:
+        stack_shape = (base_num_decoder_layers,)
+        layer_weight["gate"]["kernel"] = np.zeros(stack_shape + gate.shape, dtype=np.float16)
+      layer_weight["gate"]["kernel"][layer_idx, ...] = gate
+      for k in tqdm(range(num_experts), desc="experts", leave=False):
         wi_0 = np.concatenate(
             [
                 var[f"layers.{layer_idx}.feed_forward.experts.{k}.w1.weight"].type(torch.float16).numpy()
@@ -271,43 +410,22 @@ def convert(base_model_path, maxtext_model_path, model_size):
             ],
             axis=1,
         ).transpose()
-        layer_weight[f"mlp_{k}"]["wi_0"]["kernel"].append(wi_0)
-        layer_weight[f"mlp_{k}"]["wi_1"]["kernel"].append(wi_1)
-        layer_weight[f"mlp_{k}"]["wo"]["kernel"].append(wo)
+        if layer_weight["mlp"]["wi_0"]["kernel"] is None:
+          stack_shape = (num_experts, base_num_decoder_layers)
+          layer_weight["mlp"]["wi_0"]["kernel"] = np.zeros(stack_shape + wi_0.shape, dtype=np.float16)
+          layer_weight["mlp"]["wi_1"]["kernel"] = np.zeros(stack_shape + wi_1.shape, dtype=np.float16)
+          layer_weight["mlp"]["wo"]["kernel"] = np.zeros(stack_shape + wo.shape, dtype=np.float16)
+          tqdm.write(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
+        ei, li = k, layer_idx
+        layer_weight["mlp"]["wi_0"]["kernel"][ei, li, ...] = wi_0
+        layer_weight["mlp"]["wi_1"]["kernel"][ei, li, ...] = wi_1
+        layer_weight["mlp"]["wo"]["kernel"][ei, li, ...] = wo
+      gc.collect()
+      tqdm.write(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
+  print(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
 
-  self_attention["query"]["kernel"] = np.array(self_attention["query"]["kernel"])
-  self_attention["key"]["kernel"] = np.array(self_attention["key"]["kernel"])
-  self_attention["value"]["kernel"] = np.array(self_attention["value"]["kernel"])
-  self_attention["out"]["kernel"] = np.array(self_attention["out"]["kernel"])
-  self_attention["query"]["kernel"] = np.transpose(self_attention["query"]["kernel"], axes=(1, 0, 2, 3))
-  self_attention["key"]["kernel"] = np.transpose(self_attention["key"]["kernel"], axes=(1, 0, 2, 3))
-  self_attention["value"]["kernel"] = np.transpose(self_attention["value"]["kernel"], axes=(1, 0, 2, 3))
-  # layers, base_num_query_heads * head_dim, base_num_query_heads, head_dim =>
-  # base_num_query_heads, layers,head_dim, base_num_query_heads * head_dim
-  self_attention["out"]["kernel"] = np.transpose(self_attention["out"]["kernel"], axes=(2, 0, 3, 1))
-
-  # scale the query weights
-  self_attention["query"]["kernel"] = self_attention["query"]["kernel"] / np.sqrt(head_dim)
-
-  jax_weights["decoder"]["layers"]["self_attention"] = self_attention
-
-  # self attention layer norm and swap the layer index
-  layer_weight["pre_self_attention_layer_norm"]["scale"] = np.array(layer_weight["pre_self_attention_layer_norm"]["scale"])
-  layer_weight["post_self_attention_layer_norm"]["scale"] = np.array(layer_weight["post_self_attention_layer_norm"]["scale"])
-  layer_weight["pre_self_attention_layer_norm"]["scale"] = np.transpose(
-      layer_weight["pre_self_attention_layer_norm"]["scale"], axes=(1, 0)
-  )
-  layer_weight["post_self_attention_layer_norm"]["scale"] = np.transpose(
-      layer_weight["post_self_attention_layer_norm"]["scale"], axes=(1, 0)
-  )
-
-  jax_weights["decoder"]["layers"]["pre_self_attention_layer_norm"] = layer_weight["pre_self_attention_layer_norm"]
-  jax_weights["decoder"]["layers"]["post_self_attention_layer_norm"] = layer_weight["post_self_attention_layer_norm"]
 
   if num_experts is None:
-    layer_weight["mlp"]["wi_0"]["kernel"] = np.array(layer_weight["mlp"]["wi_0"]["kernel"])
-    layer_weight["mlp"]["wi_1"]["kernel"] = np.array(layer_weight["mlp"]["wi_1"]["kernel"])
-    layer_weight["mlp"]["wo"]["kernel"] = np.array(layer_weight["mlp"]["wo"]["kernel"])
     # swap the layer index
     layer_weight["mlp"]["wi_0"]["kernel"] = np.transpose(layer_weight["mlp"]["wi_0"]["kernel"], axes=(1, 0, 2))
     layer_weight["mlp"]["wi_1"]["kernel"] = np.transpose(layer_weight["mlp"]["wi_1"]["kernel"], axes=(1, 0, 2))
@@ -315,26 +433,34 @@ def convert(base_model_path, maxtext_model_path, model_size):
 
     jax_weights["decoder"]["layers"]["mlp"] = layer_weight["mlp"]
   else:
-    layer_weight["gate"]["kernel"] = np.array(layer_weight["gate"]["kernel"])
     layer_weight["gate"]["kernel"] = np.transpose(layer_weight["gate"]["kernel"], axes=(1, 0, 2))
     jax_weights["decoder"]["layers"]["MoeBlock_0"]["gate"]["kernel"] = layer_weight["gate"]["kernel"]
-    all_wi_0 = []
-    all_wi_1 = []
-    all_wo = []
 
-    for k in range(num_experts):
-      layer_weight[f"mlp_{k}"]["wi_0"]["kernel"] = np.array(layer_weight[f"mlp_{k}"]["wi_0"]["kernel"])
-      layer_weight[f"mlp_{k}"]["wi_1"]["kernel"] = np.array(layer_weight[f"mlp_{k}"]["wi_1"]["kernel"])
-      layer_weight[f"mlp_{k}"]["wo"]["kernel"] = np.array(layer_weight[f"mlp_{k}"]["wo"]["kernel"])
+    jax_weights["decoder"]["layers"]["MoeBlock_0"]["wi_0"] = layer_weight["mlp"]["wi_0"]["kernel"]
+    jax_weights["decoder"]["layers"]["MoeBlock_0"]["wi_1"] = layer_weight["mlp"]["wi_1"]["kernel"]
+    jax_weights["decoder"]["layers"]["MoeBlock_0"]["wo"] = layer_weight["mlp"]["wo"]["kernel"]
+  print(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
 
-      all_wi_0.append(layer_weight[f"mlp_{k}"]["wi_0"]["kernel"])
-      all_wi_1.append(layer_weight[f"mlp_{k}"]["wi_1"]["kernel"])
-      all_wo.append(layer_weight[f"mlp_{k}"]["wo"]["kernel"])
+  del pytorch_vars
+  gc.collect()
+  print(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
+  return jax_weights
 
-    jax_weights["decoder"]["layers"]["MoeBlock_0"]["wi_0"] = np.array(all_wi_0)
-    jax_weights["decoder"]["layers"]["MoeBlock_0"]["wi_1"] = np.array(all_wi_1)
-    jax_weights["decoder"]["layers"]["MoeBlock_0"]["wo"] = np.array(all_wo)
 
+
+def save_jax_weights_to_checkpoint(maxtext_model_path, jax_weights):
+  """
+  Function to save jax_weights ready for MaxText to a parameters checkpoint
+
+  Attributes:
+  maxtext_model_path: Path to save the MaxText checkpoint to
+  model_size: llama2-7b to 70b, mistral-7b, or mixtral-8x7b, mixtral-8x22b
+  """
+  """Save maxtext parameter checkpoint."""
+
+  mem_info = psutil.Process()
+  print(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
+  gc.collect()
   mesh = jax.sharding.Mesh(jax.devices(), "checkpoint_sharding_axis")
   s1 = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("checkpoint_sharding_axis"))  # shards first axis
   s2 = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, "checkpoint_sharding_axis"))  # shards second axis
@@ -352,7 +478,16 @@ def convert(base_model_path, maxtext_model_path, model_size):
       return jax.device_put(arr, device=s3)
 
   # convert all weights to jax.numpy with sharding if applicable
-  jax_weights = jax.tree_util.tree_map(checkpoint_device_put, jax_weights)
+  jax_weights_flat, jax_weights_struct = tree.flatten(jax_weights)
+  jax_weights_new = []
+  while len(jax_weights_flat) > 0:
+    jax_weight = jax_weights_flat.pop(0)
+    jax_weights_new.append(checkpoint_device_put(jax_weight))
+    del jax_weight
+    gc.collect()
+    print(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
+
+  jax_weights = tree.unflatten(jax_weights_struct, jax_weights_new)
 
   # dummy configs for the checkpoint_manager
   step_number_to_save_new_ckpt = 0
@@ -368,13 +503,12 @@ def convert(base_model_path, maxtext_model_path, model_size):
       step=0, apply_fn=None, params={"params": jax_weights}, tx=None, opt_state={}  # type: ignore
   )
 
+  print(f"Memory usage: {mem_info.memory_info().rss / (1024 ** 3):.2f} GB")
   if checkpoint_manager is not None:
     if save_checkpoint(checkpoint_manager, step_number_to_save_new_ckpt, state_new):
       max_logging.log(f"saved a checkpoint at step {step_number_to_save_new_ckpt}")
     # Upon preemption, exit when and only when all ongoing saves are complete.
-    if checkpoint_manager.reached_preemption(0):
-      checkpoint_manager.wait_until_finished()
-      sys.exit()
+    checkpoint_manager.wait_until_finished()
 
 
 if __name__ == "__main__":
@@ -390,4 +524,5 @@ if __name__ == "__main__":
 
   os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={SIMULATED_CPU_DEVICES_COUNT}"
 
-  convert(args.base_model_path, args.maxtext_model_path, args.model_size)
+  save_jax_weights_to_checkpoint(args.maxtext_model_path,
+                                 convert_to_jax_weights(args.base_model_path, args.model_size))

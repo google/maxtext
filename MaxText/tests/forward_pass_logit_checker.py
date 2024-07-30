@@ -111,6 +111,11 @@ def main(config, test_args):
     max_logging.log(f"{full_train_logits[0, 0, :]=}")
     token_size = int(test_args.token_size) if test_args.token_size else golden_logits.shape[0]
     max_logging.log(f"Max Difference {np.max(np.subtract(full_train_logits[0, :token_size, :], golden_logits[:token_size, :]))}")
+    aerr = np.linalg.norm(np.subtract(full_train_logits[0, :token_size, :], golden_logits[:token_size, :]))
+    max_logging.log(f"Absolute Error: {aerr}")
+    rerr = (np.linalg.norm(np.subtract(full_train_logits[0, :token_size, :], golden_logits[:token_size, :]))
+            / np.linalg.norm(golden_logits[:token_size, :]))
+    max_logging.log(f"Relative error: {rerr}")
     assert jax.numpy.allclose(
             full_train_logits[0, :token_size, :], golden_logits[:token_size, :], rtol=float(test_args.rtol), atol=float(test_args.atol), equal_nan=False
         )

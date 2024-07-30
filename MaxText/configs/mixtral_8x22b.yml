@@ -1,0 +1,21 @@
+base_config: "base.yml"
+
+# Args coming from the NVIDIA spreadsheet http://shortn/_W9CzVbtQde and
+# third_party/py/maxtext/configs/a3/llama_2_7b.
+hardware: "tpu"
+steps: 5
+model_name: "mixtral-8x22b"
+use_iota_embed: True
+scan_layers: True
+enable_checkpointing: True
+logits_dot_in_fp32: False
+num_experts: 8
+
+dataset_type: "synthetic"
+tokenizer_path: assets/tokenizer.mixtral-8x22b
+
+remat_policy: "full"
+max_prefill_predict_length: 16 
+max_target_length: 128
+attention: "autoselected"
+weight_dtype: "float16"
