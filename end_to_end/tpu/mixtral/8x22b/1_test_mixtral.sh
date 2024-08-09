@@ -12,8 +12,6 @@
 set -ex
 MODEL_VARIATION='8x22b'
 
-#exit # skip this test as the assets at gs://maxtext-external are not ready
-
 if [ -z "${BASE_OUTPUT_PATH}" ]; then
     # Non-Googlers please remember to point BASE_OUTPUT_PATH to GCS buckets that you own, this script uses internal buckets for testing.
     export BASE_OUTPUT_PATH=gs://runner-maxtext-logs/$(date +%Y-%m-%d-%H-%M)/
