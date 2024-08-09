@@ -59,6 +59,8 @@ def create_orbax_checkpoint_manager(
   else:
     item_names = ("items",)
 
+  # local storage checkpoint needs parent directory created
+  p.mkdir(exist_ok=True, parents=True)
   mngr = CheckpointManager(
       p,
       item_names=item_names,
