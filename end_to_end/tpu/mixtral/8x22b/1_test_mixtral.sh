@@ -12,7 +12,7 @@
 set -ex
 MODEL_VARIATION='8x22b'
 
-exit # skip this test as the assets at gs://maxtext-external are not ready
+#exit # skip this test as the assets at gs://maxtext-external are not ready
 
 if [ -z "${BASE_OUTPUT_PATH}" ]; then
     # Non-Googlers please remember to point BASE_OUTPUT_PATH to GCS buckets that you own, this script uses internal buckets for testing.
@@ -22,8 +22,8 @@ fi
 
 # Download checkpoint
 pip3 install torch
-gcloud storage cp -r gs://maxtext-external/mixtral-8x22B-v0.1-Instruct /tmp
-
+gcloud storage cp -r gs://maxtext-external/Mixtral-8x22B-Instruct-v0.1 /tmp
+                     
 # Convert it to MaxText(orbax) format - scanned ckpt
 JAX_PLATFORMS=cpu python3 MaxText/llama_or_mistral_ckpt.py --base-model-path=/tmp/mixtral-8x22B-v0.1-Instruct --model-size=mixtral-8x22b --maxtext-model-path=${BASE_OUTPUT_PATH}${MODEL_VARIATION}/scanned_ckpt/
 echo "Wrote MaxText compatible scanned checkpoint to ${BASE_OUTPUT_PATH}${MODEL_VARIATION}/scanned_ckpt"
