@@ -504,6 +504,8 @@ def create_engine_from_config_flags(batch_size, max_prefill_predict_length, max_
     args[k.strip()] = v.strip()
   assert "load_parameters_path" in args, "load_parameters_path must be defined"
   updated_args = ["MaxText/maxengine_server.py", "../configs/base.yml"]
+  #updated_args = ["MaxText/maxengine_server.py", "./configs/base.yml"]
+
   for k, v in args.items():
     option = f"{k}={v}"
     updated_args.append(option)

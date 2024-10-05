@@ -421,6 +421,7 @@ def main(argv):
   dataset = pd.read_pickle(FLAGS.dataset_path)
   if FLAGS.total_sample_count < len(dataset):
     dataset = dataset.sample(n=FLAGS.total_sample_count)
+    #assert False, f"total_sample_count {FLAGS.total_sample_count} dataset_len {len(dataset)}"
   estimated_counts_by_bucket = _estimated_counts_by_bucket(dataset)
   log.info(f"Dataset len {len(dataset)}, estimated counts by bucket {estimated_counts_by_bucket}")
 
@@ -428,7 +429,6 @@ def main(argv):
   len_batch_str = FLAGS.prefill_lengths_and_batch_sizes
   log.info(f"Prefill lengths and Batch sizes: {len_batch_str}")
   log.info(f"Maxengine args: {FLAGS.maxengine_args}")
-  length_and_batch = [tuple(map(int, lb.split(","))) for lb in len_batch_str.split("|")]
 
   log.info("Get warmup samples")
   warmup_samples = get_warmup_samples(dataset)
