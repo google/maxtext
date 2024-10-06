@@ -395,7 +395,7 @@ def _estimated_counts_by_bucket(dataset):
     count = len(dataset[condition])
     estimates[f"{prev_len}-{prefix_len}"] = math.ceil((count - total_count) * mult)
     total_count = count
-  estimates[f">{prefix_len}"] = math.ceil((len(dataset) - total_count) * mult)
+  estimates[f">{prefix_lens[-1]}"] = math.ceil((len(dataset) - total_count) * mult)
   return estimates
 
 
