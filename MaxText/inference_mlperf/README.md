@@ -82,22 +82,6 @@ python MaxText/decode.py MaxText/configs/base.yml tokenizer_path=${TOKENIZER_PAT
 
 Your checkpoint is generated at `$SAVE_QUANT_PARAMS_PATH`. This is used to set `load_parameters_path` param below in `MAXENGINE_ARGS` env variable. 
 
-## HF login
-```
-huggingface-cli login
-```
-
-## Loadgen settings
-```
-export API_URL=0.0.0.0:9000
-export DATA_DISK_DIR=/loadgen_run_data
-export DATASET_TYPE=full # for calibration run, DATASET_TYPE=calibration
-
-export MODEL_NAME=llama70b
-export TOTAL_SAMPLE_COUNT=24576 # for calibration run, TOTAL_SAMPLE_COUNT=1000
-export LOG_INTERVAL=1000
-export USER_CONFIG=user.conf
-```
 
 ## Run offline benchmarks
 ```
