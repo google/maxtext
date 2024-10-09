@@ -18,6 +18,7 @@ limitations under the License.
 import datetime
 import jax
 import json
+import os
 import sys
 
 from collections.abc import MutableMapping
@@ -59,15 +60,15 @@ def prefill_benchmark(config, engine, params, tokens, true_length, num_model_par
   jax.block_until_ready(prefill_result)
   del prefill_result
 
-  print(f"Prefill benchmark results for length {tokens.size}:\n")
+  #print(f"Prefill benchmark results for length {tokens.size}:\n")
   time_in_s = prefill_benchmark_loop(engine, params, tokens, true_length, iters)
   prefill_average_ms = 1000 * time_in_s / iters
   prefill_tflops_per_device, _, _ = maxtext_utils.calculate_prefill_tflops_per_device(num_model_params, tokens.size, config)
   tflops_per_sec_per_device = prefill_tflops_per_device / prefill_average_ms * 1000.0
   print(
-      f"\tPrefill step average time: {prefill_average_ms:.3f} ms\n"
-      f"\tPrefill total TFLOPs/device: {prefill_tflops_per_device:.3f}\n"
-      f"\tPrefill TFLOPs/sec/device: {tflops_per_sec_per_device:.3f}\n\n\n\n"
+      f"\tPrefill {tokens.size} step average time: {prefill_average_ms:.3f} ms\n"
+      # f"\tPrefill total TFLOPs/device: {prefill_tflops_per_device:.3f}\n"
+      # f"\tPrefill TFLOPs/sec/device: {tflops_per_sec_per_device:.3f}\n\n\n\n"
   )
   result_dict = {
       "time_in_ms": prefill_average_ms,
@@ -106,12 +107,12 @@ def prefill_insert_benchmark(config, engine, decode_state, params, total_slots, 
     del prefill_result
   jax.block_until_ready(decode_state)
 
-  print(f"Prefill and insert benchmark results for length {tokens.size}:\n")
+  #print(f"Prefill and insert benchmark results for length {tokens.size}:\n")
   time_in_s, decode_state = prefill_insert_benchmark_loop(
       config, engine, decode_state, params, total_slots, tokens, true_length, iters, f"prefill_insert_{tokens.size}"
   )
   prefill_insert_average_ms = time_in_s / iters * 1000.0
-  print(f"\tPrefill + Insert step average time: {prefill_insert_average_ms:.3f} ms\n\n\n\n")
+  print(f"\tPrefill {tokens.size} + Insert step average time: {prefill_insert_average_ms:.3f} ms\n\n\n\n")
   result_dict = {"time_in_ms": prefill_insert_average_ms}
   return result_dict, decode_state
 
@@ -202,7 +203,7 @@ def write_results(results, filename, flatten_microbenchmark_results):
 
 def print_results_for_analyze(results):
   """Print results."""
-  print("\nFor usage in analyze_sharegpt.py :")
+  #print("\nFor usage in analyze_sharegpt.py :")
 
   if "prefill" in results:
     prefill_bucket_size_to_ms = {}
@@ -222,7 +223,7 @@ def print_results_for_analyze(results):
 
 def summarize_prefill_result(engine, params, tokens, true_length):
   """Summarize Prefill result."""
-  print(f"Prefill result of length {tokens.size}:\n")
+  #print(f"Prefill result of length {tokens.size}:\n")
   rng = jax.random.PRNGKey(1234)
   prefill_result, _ = engine.prefill(params=params, padded_tokens=tokens, true_length=true_length, rng=rng)
   jax.block_until_ready(prefill_result)
@@ -309,7 +310,7 @@ def main(config, inference_metadata: Optional[Dict[str, Any]] = None):
     )
 
   results = collate_results(config, benchmark_results, model_size, cache_size, num_model_params)
-  print_results_for_analyze(results)
+  #print_results_for_analyze(results)
   if inference_metadata:
     flatten_microbenchmark_results = pyconfig.string_to_bool(
         inference_metadata.get("flatten_microbenchmark_results", "false")
@@ -326,5 +327,9 @@ def main(config, inference_metadata: Optional[Dict[str, Any]] = None):
 
 if __name__ == "__main__":
   jax.config.update("jax_default_prng_impl", "unsafe_rbg")
+  print("LIBTPU_INIT_ARGS:")
+  print(os.environ['LIBTPU_INIT_ARGS'] if  'LIBTPU_INIT_ARGS' in os.environ else None)
+  print("XLA_FLAGS:")
+  print(os.environ['XLA_FLAGS'] if  'XLA_FLAGS' in os.environ else None)
   pyconfig.initialize(sys.argv)
   main(pyconfig.config)
