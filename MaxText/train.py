@@ -55,6 +55,7 @@ import jax.numpy as jnp
 from jax import random
 from jax.sharding import Mesh
 from jax.experimental import checkify
+from jax.experimental.compute_on import compute_on
 
 from cloud_tpu_diagnostics import diagnostic
 from cloud_tpu_diagnostics.configuration import debug_configuration
@@ -72,6 +73,19 @@ Transformer = models.Transformer
 EPS = 1e-8
 _DEFAULT_OCDBT_TARGET_DATA_FILE_SIZE = 2 * 1024**3
 
+def with_memory_kind(t, memory_kind):
+  return jax.tree_util.tree_map(
+      lambda x: x.with_memory_kind(kind=memory_kind), t
+  )
+
+def cast_dtype_from_to(nest, src, dst):
+  """All items in nest with dtype src are casted to dtype dst."""
+  return jax.tree_util.tree_map(
+      lambda t: t.astype(dst) if t.dtype == src else t, nest
+  )
+
+def cast_to_bf16(params):
+  return cast_dtype_from_to(params, np.float32, jnp.bfloat16)
 
 def validate_train_config(config):
   """Validates the configuration is set correctly for train.py"""
@@ -323,7 +337,8 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   return loss, aux
 
 
-def train_step(model, config, state, data, dropout_rng):
+
+def train_step(model, config, mesh, state_mesh_shardings, state, data, dropout_rng):
   """
 
   Args:
@@ -338,6 +353,7 @@ def train_step(model, config, state, data, dropout_rng):
     rng2: A new rng key that can be used in future calls.
 
   """
+
   if config.gradient_accumulation_steps > 1:
 
     def accumulate_gradient(acc_grad_and_loss, data):
@@ -381,15 +397,21 @@ def train_step(model, config, state, data, dropout_rng):
     grads = maxtext_utils.apply_gradient_clipping(raw_grads, state, config.gradient_clipping_threshold)
   else:
     grads = raw_grads
-  new_state = state.apply_gradients(grads=grads)
+  if config.optimizer_host_offload:
+    # state_mesh_shardings = jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), state_mesh_annotations)
+    grads = jax.device_put(grads, with_memory_kind(state_mesh_shardings.params, 'pinned_host'))
+    with compute_on('device_host'):
+      new_state = state.apply_gradients(grads=grads)
+  else:
+    new_state = state.apply_gradients(grads=grads)
   metrics = {
       "scalar": {
           "learning/loss": loss,
           "learning/moe_lb_loss": moe_lb_loss,
           "learning/total_weights": total_weights,
-          "learning/grad_norm": max_utils.l2norm_pytree(grads),
-          "learning/raw_grad_norm": max_utils.l2norm_pytree(raw_grads),
-          "learning/param_norm": max_utils.l2norm_pytree(new_state.params),
+          # "learning/grad_norm": max_utils.l2norm_pytree(grads),
+          # "learning/raw_grad_norm": max_utils.l2norm_pytree(raw_grads),
+          # "learning/param_norm": max_utils.l2norm_pytree(new_state.params),
       },
       "scalars": {},
   }
@@ -534,9 +556,14 @@ def setup_train_loop(config):
   record_goodput(recorder, config, recorder.record_training_preparation_start_time if recorder else None)
   data_iterator, eval_data_iterator = create_data_iterator(config, mesh)
 
-  state, state_mesh_annotations, data_iterator = max_utils.setup_training_state(
+  state, state_mesh_annotations, state_mesh_shardings, data_iterator = max_utils.setup_training_state(
       model, data_iterator, tx, config, init_rng, mesh, checkpoint_manager
   )
+  # print(f"This is in setup_train_loop {state_mesh_shardings=}")
+  # if config.optimizer_host_offload:
+  #   params = jax.device_put(state.params, with_memory_kind(state_mesh_shardings.params, 'pinned_host'))
+  #   opt_state = jax.device_put(state.opt_state, with_memory_kind(state_mesh_shardings.opt_state, 'pinned_host'))
+  #   state = state.replace(params = params, opt_state = opt_state)
 
   if not config.using_pipeline_parallelism:
     # The vocab tensor(s) of shape [vocab, embed] (and transpose) are not sharded by stage
@@ -547,6 +574,7 @@ def setup_train_loop(config):
       writer,
       checkpoint_manager,
       state_mesh_annotations,
+      state_mesh_shardings,
       model,
       mesh,
       learning_rate_schedule,
@@ -573,6 +601,7 @@ def train_loop(config, state=None):
       writer,
       checkpoint_manager,
       state_mesh_annotations,
+      state_mesh_shardings,
       model,
       mesh,
       learning_rate_schedule,
@@ -587,7 +616,7 @@ def train_loop(config, state=None):
       out_shard_train,
       static_argnums_train,
       donate_argnums_train,
-  ) = maxtext_utils.get_functional_train_with_signature(train_step, mesh, state_mesh_annotations, model, config)
+  ) = maxtext_utils.get_functional_train_with_signature(train_step, mesh, state_mesh_shardings, model, config)
 
   if eval_data_iterator:
     # pylint: disable=line-too-long
@@ -597,7 +626,7 @@ def train_loop(config, state=None):
         out_shard_eval,
         static_argnums_eval,
         donate_argnums_eval,
-    ) = maxtext_utils.get_functional_eval_with_signature(eval_step, mesh, state_mesh_annotations, model, config)
+    ) = maxtext_utils.get_functional_eval_with_signature(eval_step, mesh, state_mesh_shardings, model, config)
 
   num_model_parameters = max_utils.calculate_num_params_from_pytree(state.params)
   max_logging.log(f"number parameters: {num_model_parameters/1e9:.3f} billion")
@@ -624,7 +653,7 @@ def train_loop(config, state=None):
         out_shardings=out_shard_train,
         static_argnums=static_argnums_train,
         donate_argnums=donate_argnums_train,
-    )
+    ) 
 
     if eval_data_iterator:
       p_eval_step = jax.jit(
@@ -654,6 +683,11 @@ def train_loop(config, state=None):
       jax.block_until_ready(state)  # Block until previous state finishes to start profile cleanly
       prof.activate()
 
+    # if config.optimizer_host_offload: # just offloading the state
+    #   state_mesh_shardings = jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), state_mesh_annotations)
+    #   params = jax.device_put(state.params, with_memory_kind(state_mesh_shardings.params, 'device'))
+    #   state.replace(params = params)
+
     with jax.profiler.StepTraceAnnotation("train", step_num=step):
       record_goodput(recorder, config, recorder.record_data_loading_start_time if recorder else None)
       example_batch = load_next_batch(data_iterator, example_batch, config)
@@ -664,6 +698,12 @@ def train_loop(config, state=None):
       record_goodput(recorder, config, recorder.record_step_start_time if recorder else None, step)
       with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
         state, metrics = p_train_step(state, example_batch, nextrng)
+
+    # if config.optimizer_host_offload: # just offloading the state
+    #   state_mesh_shardings = jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), state_mesh_annotations)
+    #   # params = jax.device_put(state.params, with_memory_kind(state_mesh_shardings.params, 'pinned_host'))
+    #   opt_state = jax.device_put(state.opt_state, with_memory_kind(state_mesh_shardings.opt_state, 'pinned_host'))
+    #   state.replace(opt_state = opt_state)
 
     new_time = datetime.datetime.now()
     record_scalar_metrics(
@@ -736,9 +776,11 @@ def train_loop(config, state=None):
 
 def main(argv: Sequence[str]) -> None:
   jax.config.update("jax_default_prng_impl", "unsafe_rbg")
+  # jax.config.update('jax_enable_memories', True)
   os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
   if "xla_tpu_spmd_rng_bit_generator_unsafe" not in os.environ.get("LIBTPU_INIT_ARGS", ""):
     os.environ["LIBTPU_INIT_ARGS"] = os.environ.get("LIBTPU_INIT_ARGS", "") + " --xla_tpu_spmd_rng_bit_generator_unsafe=true"
+  os.environ["LIBTPU_INIT_ARGS"] = os.environ.get("LIBTPU_INIT_ARGS", "") + " --xla_tpu_enable_host_aware_passes=true"
   pyconfig.initialize(argv)
   max_utils.print_system_information()
   config = pyconfig.config
